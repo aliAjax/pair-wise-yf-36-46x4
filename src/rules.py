@@ -30,28 +30,59 @@ def _validate_sample_store(actor, entity, data, lookup):
     return {"stored_at": "2026-09-24T00:00:00Z"}
 
 
+def _validate_sample_return(actor, entity, data, lookup):
+    if entity["status"] != "pending_return":
+        return None
+    patch = {"destroy_reason": "returned after withdrawal execution; destroyed"}
+    if data.get("returned_at"):
+        patch["returned_at"] = data["returned_at"]
+    return "destroyed", patch
+
+
 def _validate_withdrawal_approve(actor, entity, data, lookup):
     samples = data.get("sample_ids") or []
     if len(set(samples)) != len(samples):
         raise ConflictError("sample_ids contains duplicates")
+    participant_id = (entity or {}).get("data", {}).get("participant_id")
+    snapshot_samples = []
     for sample_id in samples:
-        if not _find_one(lookup, "sample", "id", sample_id):
+        sample = _find_one(lookup, "sample", "id", sample_id)
+        if not sample:
             raise ValidationError("unknown sample: " + str(sample_id))
-    return {"approved_by": actor.user_id}
+        if participant_id and sample["data"].get("participant_id") != participant_id:
+            raise ValidationError(
+                "sample %s does not belong to the withdrawal participant" % sample_id
+            )
+        snapshot_samples.append(
+            {"id": sample["id"], "status": sample["status"], "version": sample["version"]}
+        )
+    snapshot_consents = [
+        {"id": consent["id"], "status": consent["status"], "version": consent["version"]}
+        for consent in _find_many(lookup, "consent", "participant_id", participant_id)
+        if consent["status"] == "active"
+    ]
+    return {
+        "approved_by": actor.user_id,
+        "impact": {
+            "participant_id": participant_id,
+            "consents": snapshot_consents,
+            "samples": snapshot_samples,
+        },
+    }
 
 
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('sample', 'return'): _validate_sample_return, ('withdrawal', 'approve'): _validate_withdrawal_approve}
 
 
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan', 'pending_return'), 'stored'), 'mark_pending_return': (('on_loan',), 'pending_return'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
     ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
-    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
+    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'mark_pending_return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -101,18 +132,144 @@ class RuleEngine:
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
+        extra = {}
+        if custom:
+            result = custom(actor, entity, data, lookup)
+            if isinstance(result, tuple):
+                override_status, extra = result
+                if override_status:
+                    next_status = override_status
+                extra = extra or {}
+            elif result:
+                extra = result
         patch = dict(data)
         if extra:
             patch.update(extra)
         return next_status, patch
 
+    def assess_withdrawal_execution(self, entity, lookup, executed_at=None):
+        """Assess the impact of executing an approved withdrawal right now.
+
+        Returns a dict with per-object items, conflict messages and the update
+        plan. The plan is only safe to apply when no conflicts were found.
+        """
+        withdrawal_id = entity["id"]
+        impact = entity["data"].get("impact") or {}
+        participant_id = impact.get("participant_id") or entity["data"].get("participant_id")
+        conflicts = []
+        consent_items = []
+        sample_items = []
+        plan = []
+
+        snapshot_consents = {snap["id"]: snap for snap in impact.get("consents", [])}
+        assessed_consents = set()
+        for consent in _find_many(lookup, "consent", "participant_id", participant_id):
+            if consent["status"] != "active":
+                continue
+            assessed_consents.add(consent["id"])
+            snap = snapshot_consents.get(consent["id"])
+            item = {
+                "id": consent["id"], "kind": "consent", "status": consent["status"],
+                "version": consent["version"], "planned_action": None, "conflict": None,
+            }
+            if snap is None:
+                item["conflict"] = "consent %s became active after approval" % consent["id"]
+            elif int(consent["version"]) != int(snap["version"]):
+                item["conflict"] = "consent %s changed after approval (version %s -> %s)" % (
+                    consent["id"], snap["version"], consent["version"])
+            else:
+                item["planned_action"] = "withdraw"
+                plan.append((consent, "withdrawn", _clean({
+                    "withdrawal_id": withdrawal_id,
+                    "withdraw_reason": "participant withdrawal executed",
+                    "withdrawn_at": executed_at,
+                })))
+            if item["conflict"]:
+                conflicts.append(item["conflict"])
+            consent_items.append(item)
+        for snap_id in snapshot_consents:
+            if snap_id in assessed_consents:
+                continue
+            current = _find_one(lookup, "consent", "id", snap_id)
+            if current is None:
+                item = {"id": snap_id, "kind": "consent", "status": None, "version": None,
+                        "planned_action": None,
+                        "conflict": "consent %s no longer exists" % snap_id}
+            else:
+                item = {"id": snap_id, "kind": "consent", "status": current["status"],
+                        "version": current["version"], "planned_action": None,
+                        "conflict": "consent %s is no longer active (status: %s)" % (
+                            snap_id, current["status"])}
+            conflicts.append(item["conflict"])
+            consent_items.append(item)
+
+        for snap in impact.get("samples", []):
+            current = _find_one(lookup, "sample", "id", snap["id"])
+            if current is None:
+                item = {"id": snap["id"], "kind": "sample", "status": None, "version": None,
+                        "planned_action": None,
+                        "conflict": "sample %s no longer exists" % snap["id"]}
+                conflicts.append(item["conflict"])
+                sample_items.append(item)
+                continue
+            item = {
+                "id": current["id"], "kind": "sample", "status": current["status"],
+                "version": current["version"], "planned_action": None, "conflict": None,
+            }
+            if current["status"] != snap["status"]:
+                item["conflict"] = "sample %s status changed after approval (%s -> %s)" % (
+                    snap["id"], snap["status"], current["status"])
+                conflicts.append(item["conflict"])
+            elif current["status"] in ("stored", "collected"):
+                item["planned_action"] = "destroy"
+                plan.append((current, "destroyed", _clean({
+                    "withdrawal_id": withdrawal_id,
+                    "destroy_reason": "participant withdrawal executed",
+                    "destroyed_at": executed_at,
+                })))
+            elif current["status"] == "on_loan":
+                item["planned_action"] = "pending_return"
+                plan.append((current, "pending_return", _clean({
+                    "withdrawal_id": withdrawal_id,
+                    "pending_return_reason": "participant withdrawal executed; awaiting return before destruction",
+                    "pending_return_at": executed_at,
+                })))
+            else:
+                item["planned_action"] = "none"
+            sample_items.append(item)
+
+        return {
+            "participant_id": participant_id,
+            "consents": consent_items,
+            "samples": sample_items,
+            "conflicts": conflicts,
+            "plan": plan,
+        }
+
+    def plan_withdrawal_execution(self, entity, data, lookup):
+        assessment = self.assess_withdrawal_execution(
+            entity, lookup, executed_at=data.get("executed_at")
+        )
+        if assessment["conflicts"]:
+            raise ConflictError(
+                "withdrawal execution blocked: " + "; ".join(assessment["conflicts"])
+            )
+        return assessment
+
+
+def _find_many(lookup, kind, field, value):
+    if lookup is None:
+        return []
+    return lookup(kind, field, value) or []
+
 
 def _find_one(lookup, kind, field, value):
-    if lookup is None:
-        return None
-    rows = lookup(kind, field, value) or []
+    rows = _find_many(lookup, kind, field, value)
     return rows[0] if rows else None
+
+
+def _clean(patch):
+    return {key: value for key, value in patch.items() if value is not None}
 
 
 def _date_ordinal(value):

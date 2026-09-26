@@ -33,9 +33,20 @@ python3 app.py --db ./data.db --port 8302
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/withdrawals/<id>/impact`：撤回单影响预览；已执行的撤回单返回执行报告。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 撤回单执行
+
+撤回单`approve`时会快照影响范围：参与者当前生效的同意（含版本）和批准的样本清单（含状态）。`execute`一次完成收口：
+
+- 同一参与者仍生效的同意一起撤回（`active -> withdrawn`）。
+- 库内样本（`stored`/`collected`）销毁为`destroyed`。
+- 借出样本（`on_loan`）先标记`pending_return`；归还（`return`）后直接销毁。
+
+执行前若快照中的同意版本或样本状态发生变化（含批准后新生效的同意），执行被拒绝并说明冲突。所有级联更新与审计在同一事务内完成，任一对象版本冲突都会整体回滚。相同的执行请求重试返回首次结果；请求内容不同的重复执行返回冲突。
 
 ## 测试
 

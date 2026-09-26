@@ -9,6 +9,13 @@
     main { max-width: 820px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    input, select { padding: .35rem .5rem; }
+    table { border-collapse: collapse; margin: .5rem 0 1rem; width: 100%; }
+    th, td { border: 1px solid #d1d5db; padding: .35rem .6rem; text-align: left; font-size: .9rem; }
+    th { background: #f9fafb; }
+    .conflict { color: #b91c1c; }
+    .ok { color: #047857; }
+    .panel { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; margin-top: 1.5rem; }
   </style>
 </head>
 <body>
@@ -17,17 +24,127 @@
   <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
+
+  <section class="panel">
+    <h2>撤回单执行</h2>
+    <p>
+      <label>用户ID <input id="userId" value="staff-1"></label>
+      <label>角色
+        <select id="role">
+          <option value="admin">admin</option>
+          <option value="biobank" selected>biobank</option>
+          <option value="committee">committee</option>
+          <option value="researcher">researcher</option>
+        </select>
+      </label>
+      <label>撤回单ID <input id="withdrawalId" size="36" placeholder="withdrawal id"></label>
+    </p>
+    <p>
+      <button onclick="previewImpact()">1. 预览影响范围</button>
+      <button onclick="executeWithdrawal()">2. 执行撤回</button>
+    </p>
+    <div id="impact"></div>
+  </section>
+
   <h2>常用接口</h2>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/withdrawals/&lt;id&gt;/impact</pre>
 </main>
 <script>
+function headers() {
+  return {
+    "Content-Type": "application/json",
+    "X-User-Id": document.getElementById("userId").value || "anonymous",
+    "X-Role": document.getElementById("role").value
+  };
+}
+
+function show(payload) {
+  document.getElementById("result").textContent = JSON.stringify(payload, null, 2);
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await response.json());
+}
+
+function esc(value) {
+  return String(value == null ? "" : value).replace(/[&<>"]/g, c => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]
+  ));
+}
+
+function renderTable(title, rows, columns) {
+  if (!rows || !rows.length) return "";
+  let html = "<h3>" + esc(title) + "</h3><table><tr>" +
+    columns.map(c => "<th>" + esc(c[0]) + "</th>").join("") + "</tr>";
+  for (const row of rows) {
+    html += "<tr>" + columns.map(c => "<td>" + esc(row[c[1]]) + "</td>").join("") + "</tr>";
+  }
+  return html + "</table>";
+}
+
+function renderImpact(payload) {
+  const box = document.getElementById("impact");
+  if (payload.error) {
+    box.innerHTML = '<p class="conflict">' + esc(payload.error) + "</p>";
+    return;
+  }
+  let html = "";
+  if (payload.phase === "preview") {
+    html += "<h3>影响范围（执行前预览）</h3>";
+    html += renderTable("生效同意（将一起撤回）", payload.consents,
+      [["同意ID", "id"], ["当前状态", "status"], ["版本", "version"], ["计划动作", "planned_action"], ["冲突", "conflict"]]);
+    html += renderTable("关联样本", payload.samples,
+      [["样本ID", "id"], ["当前状态", "status"], ["计划动作", "planned_action"], ["冲突", "conflict"]]);
+    if (payload.conflicts && payload.conflicts.length) {
+      html += '<p class="conflict">存在冲突，执行将被拒绝：</p><ul>' +
+        payload.conflicts.map(c => '<li class="conflict">' + esc(c) + "</li>").join("") + "</ul>";
+    } else {
+      html += '<p class="ok">无冲突，可以执行。</p>';
+    }
+  } else if (payload.phase === "executed") {
+    const report = payload.report || {};
+    html += "<h3>处理后的状态（已执行）</h3>";
+    html += renderTable("受影响对象", report.affected,
+      [["对象ID", "id"], ["类型", "kind"], ["原状态", "from_status"], ["处理后状态", "to_status"]]);
+    html += renderTable("无需处理", report.skipped,
+      [["对象ID", "id"], ["类型", "kind"], ["状态", "status"]]);
+  }
+  box.innerHTML = html;
+}
+
+async function previewImpact() {
+  const id = document.getElementById("withdrawalId").value.trim();
+  const response = await fetch("/api/withdrawals/" + encodeURIComponent(id) + "/impact",
+    {headers: headers()});
+  const payload = await response.json();
+  show(payload);
+  renderImpact(payload);
+}
+
+async function executeWithdrawal() {
+  const id = document.getElementById("withdrawalId").value.trim();
+  const response = await fetch("/api/entities/" + encodeURIComponent(id) + "/actions", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      action: "execute",
+      data: {executed_at: new Date().toISOString().slice(0, 10)}
+    })
+  });
+  const payload = await response.json();
+  show(payload);
+  if (response.ok) {
+    await previewImpact();
+  } else {
+    document.getElementById("impact").innerHTML =
+      '<p class="conflict">执行被拒绝：' + esc(payload.error) + "</p>";
+  }
 }
 </script>
 </body>
