@@ -54,6 +54,12 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS execution_results (
+                    idem_key TEXT PRIMARY KEY,
+                    entity_id TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -196,7 +202,92 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def get_execution_result(self, idem_key):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT entity_id, result FROM execution_results WHERE idem_key = ?",
+                (idem_key,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "entity_id": row["entity_id"],
+            "result": json.loads(row["result"]),
+        }
+
+    def unit_of_work(self):
+        return UnitOfWork(self)
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+
+class UnitOfWork:
+    """Single transaction covering the multi-entity withdrawal cascade."""
+
+    def __init__(self, repository):
+        self.repository = repository
+
+    def __enter__(self):
+        self.connection = self.repository._connect()
+        self.connection.execute("BEGIN IMMEDIATE")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.connection.commit()
+        else:
+            self.connection.rollback()
+        self.connection.close()
+        return False
+
+    def get(self, entity_id):
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self.repository._entity_from_row(row) if row else None
+
+    def update(self, entity, expected_version, status, data):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        cursor = self.connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, now, entity["id"], expected_version),
+        )
+        if cursor.rowcount == 0:
+            raise ConflictError(
+                "version conflict: entity %s is no longer at version %s"
+                % (entity["id"], expected_version)
+            )
+        return self.get(entity["id"])
+
+    def audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    def save_execution_result(self, idem_key, entity_id, result):
+        self.connection.execute(
+            "INSERT INTO execution_results(idem_key, entity_id, result, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                idem_key,
+                entity_id,
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )

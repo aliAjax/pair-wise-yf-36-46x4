@@ -51,7 +51,14 @@ class WorkflowTest(unittest.TestCase):
                     step.get("expected_version"),
                 )
             if "expect" in step:
-                self.assertEqual(entity["status"], step["expect"])
+                if step.get("op") == "transition" and step["action"] == "execute":
+                    self.assertEqual(entity["withdrawal"]["status"], step["expect"])
+                else:
+                    self.assertEqual(entity["status"], step["expect"])
+
+        # Execute cascades once: the active consent is withdrawn and the stored sample destroyed.
+        self.assertEqual(self.service.get(created["consent"])["status"], "withdrawn")
+        self.assertEqual(self.service.get(created["sample"])["status"], "destroyed")
 
 
 if __name__ == "__main__":
